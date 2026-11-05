@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/signal"
@@ -33,6 +33,7 @@ func main() {
 		scanMode  string
 		rateMs    int
 		noBanner  bool
+		discover  bool
 	)
 
 	flag.StringVar(&target, "target", "127.0.0.1", "target address")
@@ -42,8 +43,12 @@ func main() {
 	flag.StringVar(&scanMode, "scan", "syn", "Режим сканирования: 'syn' или 'connect'")
 	flag.IntVar(&rateMs, "rate", 1, "Задержка между отправкой SYN-пакетов в мс")
 	flag.BoolVar(&noBanner, "no-banner", false, "Отключить определение служб и баннеров")
+	flag.BoolVar(&discover, "discover", false, "Предварительный поиск активных хостов перед сканированием")
 
 	flag.Parse()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	portsList, err := parsePorts(portArg)
 	if err != nil {
@@ -51,62 +56,65 @@ func main() {
 		return
 	}
 
-	var targets []string
-	var dstIPS []net.IP
+	rand.Shuffle(len(portsList), func(i, j int) {
+		portsList[i], portsList[j] = portsList[j], portsList[i]
+	})
+
+	var targets []net.IP
 	var isCIDR bool = strings.Contains(target, "/")
 	if isCIDR {
-		fmt.Println("Собираем подсети...")
-		ret, _ := parseCIDR(target)
-		for _, value := range ret {
-			dstIP, err := resolveTarget(value.String())
-			if err != nil {
-				fmt.Printf("[-] Ошибка разрешения цели: %v\n", err)
-				continue
-			}
-			targets = append(targets, value.String())
-			dstIPS = append(dstIPS, dstIP)
-
-			fmt.Printf("Добавили %s (%s)\n", value.String(), dstIP)
-
+		fmt.Println("[*] Сбор адресов подсети...")
+		var err error
+		targets, err = parseCIDR(target)
+		if err != nil {
+			fmt.Printf("[-] Ошибка парсинга CIDR: %v\n", err)
+			return
 		}
-		fmt.Printf("Длина targets=%d, dstIPS=%d\n\n\n", len(targets), len(dstIPS))
+		fmt.Printf("[*] Найдено хостов в подсети: %d\n\n", len(targets))
 	} else {
 		dstIP, err := resolveTarget(target)
 		if err != nil {
 			fmt.Printf("[-] Ошибка разрешения цели: %v\n", err)
 			return
 		}
-
-		targets = append(targets, target)
-		dstIPS = append(dstIPS, dstIP)
+		targets = append(targets, dstIP)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	if discover && isCIDR {
+		fmt.Println("[*] Предварительный поиск активных хостов (ping)...")
+		targets = discoverAliveHosts(ctx, targets, time.Millisecond*300)
+		if len(targets) == 0 {
+			fmt.Println("[*] Живых хостов не обнаружено.")
+			return
+		}
+		fmt.Printf("[+] Готово к сканированию: %d хостов\n\n", len(targets))
+	}
 
-	for i := 0; i < len(targets); i++ {
-		tempDstIp := dstIPS[i]
-		tempTarget := targets[i]
+	for i, ip := range targets {
+		ipStr := ip.String()
 
 		timeout := time.Duration(timeoutMs) * time.Millisecond
-		fmt.Printf("[*] Старт сканирования хоста %s (%s) [%d портов]...\n", tempTarget, tempDstIp, len(portsList))
+		fmt.Printf("[*] Старт сканирования хоста %s [%d портов]...\n", ipStr, len(portsList))
 		startTime := time.Now()
 
-		fmt.Printf("[%d] Начинаем сканирование для %s \n", i, tempTarget)
+		fmt.Printf("[%d] Начинаем сканирование для %s\n", i, ipStr)
 		var results []Result
 
 		switch strings.ToLower(scanMode) {
 		case "syn":
-			results, err = runSYNScan(ctx, tempTarget, tempDstIp, portsList, time.Duration(rateMs)*time.Millisecond, timeout, !noBanner)
+			results, err = runSYNScan(ctx, ipStr, ip, portsList, time.Duration(rateMs)*time.Millisecond, timeout, !noBanner)
 			if err != nil {
 				fmt.Printf("[-] Ошибка инициализации WinDivert: %v\n", err)
 				fmt.Println("[!] Для работы с WinDivert (SYN-сканирование) требуются права Администратора.")
 				fmt.Println("[*] Выполняется переключение на режим Connect-сканирования...\n")
-				results = runConnectScan(ctx, tempTarget, timeout, threads, portsList, !noBanner)
+				results = runConnectScan(ctx, ipStr, timeout, threads, portsList, !noBanner)
 			}
 		case "connect":
 			fmt.Printf("[*] Режим: TCP Connect сканирование (%d потоков)\n\n", threads)
-			results = runConnectScan(ctx, tempTarget, timeout, threads, portsList, !noBanner)
+			results = runConnectScan(ctx, ipStr, timeout, threads, portsList, !noBanner)
+		case "udp":
+			fmt.Printf("[*] Режим: UDP сканирование (%d потоков)\n\n", threads)
+			results = runUDPScan(ctx, ipStr, threads, portsList, timeout)
 		default:
 			fmt.Printf("[-] Неизвестный режим сканирования '%s'. Доступны: 'syn', 'connect'\n", scanMode)
 			return
@@ -121,11 +129,15 @@ func main() {
 			return results[i].Port < results[j].Port
 		})
 
-		fmt.Printf("\n=== Итоговый отчет по хосту %s (%s) ===\n", tempTarget, tempDstIp)
+		fmt.Printf("\n=== Итоговый отчет по хосту %s ===\n", ipStr)
 		fmt.Printf("%-9s %-8s %s\n", "PORT", "STATE", "SERVICE / BANNER")
 		fmt.Println("-------------------------------------------")
+		proto := "tcp"
+		if strings.ToLower(scanMode) == "udp" {
+			proto = "udp"
+		}
 		for _, r := range results {
-			fmt.Printf("%-9s %-8s %s\n", fmt.Sprintf("%d/tcp", r.Port), "open", r.Service)
+			fmt.Printf("%-9s %-8s %s\n", fmt.Sprintf("%d/%s", r.Port, proto), "open", r.Service)
 		}
 		fmt.Printf("\nВыполнено за %.2f сек. Открыто портов: %d\n\n\n", time.Since(startTime).Seconds(), len(results))
 	}

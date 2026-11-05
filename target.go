@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 func parseCIDR(cidr string) ([]net.IP, error) {
@@ -103,4 +106,52 @@ func resolveTarget(target string) (net.IP, error) {
 		}
 	}
 	return nil, fmt.Errorf("IPv4-адрес для хоста %s не найден", target)
+}
+
+func discoverAliveHosts(ctx context.Context, targets []net.IP, timeout time.Duration) []net.IP {
+	var (
+		alive []net.IP
+		mu    sync.Mutex
+		wg    sync.WaitGroup
+	)
+
+	for _, ip := range targets {
+		wg.Add(1)
+		go func(targetIP net.IP) {
+			defer wg.Done()
+			if isAlive(ctx, targetIP, timeout) {
+				mu.Lock()
+				alive = append(alive, targetIP)
+				mu.Unlock()
+			}
+		}(ip)
+	}
+
+	wg.Wait()
+	fmt.Printf("[+] Обнаружено %d живых хостов\n", len(alive))
+	sort.Slice(alive, func(i, j int) bool {
+		return binary.BigEndian.Uint32(alive[i].To4()) < binary.BigEndian.Uint32(alive[j].To4())
+	})
+
+	return alive
+}
+
+func isAlive(ctx context.Context, ip net.IP, timeout time.Duration) bool {
+	ports := []int{80, 443, 445, 22, 135}
+	d := net.Dialer{Timeout: timeout}
+
+	for _, p := range ports {
+		conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", ip, p))
+
+		if err == nil {
+			conn.Close()
+			return true
+		}
+
+		if strings.Contains(strings.ToLower(err.Error()), "refused") {
+			return true
+		}
+	}
+
+	return false
 }
