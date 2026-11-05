@@ -1,0 +1,16 @@
+# Бинарники
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+main.exe
+my-tcp-scanner.exe
+
+# IDE (GoLand / VS Code)
+.idea/
+.vscode/
+
+# Тесты и логи
+*.log
+*.test
